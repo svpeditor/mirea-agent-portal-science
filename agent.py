@@ -207,7 +207,7 @@ def main() -> None:
     model = (
         params.get("model")
         or os.environ.get("LLM_MODEL")
-        or "anthropic/claude-3.5-haiku"
+        or "deepseek/deepseek-r1"
     ).strip()
 
     if not api_key:

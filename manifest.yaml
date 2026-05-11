@@ -1,13 +1,13 @@
 id: science-agent
 name: "Поиск научных статей"
-version: "1.2.0"
+version: "1.3.0"
 category: "научная-работа"
 icon: "🔬"
 short_description: |
-  По теме исследования спрашивает у LLM список релевантных публикаций с краткими
-  аннотациями и BibTeX. Источник — знания модели (агент работает в изолированной
-  сети без доступа к публичному arXiv). Время ответа: 10-30с (Claude Haiku) или
-  1-4 минуты (DeepSeek-R1, reasoning-модель).
+  По теме исследования спрашивает у DeepSeek-R1 список релевантных публикаций
+  с краткими аннотациями и BibTeX. Источник — знания модели (агент работает
+  в изолированной сети без доступа к публичному arXiv). DeepSeek-R1 — reasoning-
+  модель, обычно отвечает 1-4 минуты — это нормально.
 
 inputs:
   topic:
@@ -32,11 +32,11 @@ inputs:
   model:
     type: radio
     label: "Модель"
-    help: "Haiku — быстрее (10-30с), R1 — рассуждает дольше но иногда точнее (1-4 мин)."
+    help: "R1 — reasoning-модель, отвечает 1-4 минуты но даёт более точные подборки. Haiku — быстро (10-30с) но проще."
     options:
-      - { value: "anthropic/claude-3.5-haiku", label: "Claude 3.5 Haiku (быстро)" }
-      - { value: "deepseek/deepseek-r1", label: "DeepSeek-R1 (медленно)" }
-    default: "anthropic/claude-3.5-haiku"
+      - { value: "deepseek/deepseek-r1", label: "DeepSeek-R1 (рекомендуется, 1-4 мин)" }
+      - { value: "anthropic/claude-3.5-haiku", label: "Claude 3.5 Haiku (быстро, проще)" }
+    default: "deepseek/deepseek-r1"
 
 files: {}
 
