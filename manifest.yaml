@@ -1,12 +1,12 @@
 id: science-agent
 name: "Поиск научных статей"
-version: "1.0.0"
+version: "1.1.0"
 category: "научная-работа"
 icon: "🔬"
 short_description: |
-  По теме исследования ищет статьи в arXiv (опционально обогащает через
-  Semantic Scholar), ранжирует и аннотирует через DeepSeek-R1,
-  формирует Word-отчёт и BibTeX.
+  По теме исследования спрашивает у DeepSeek-R1 список релевантных публикаций
+  с краткими аннотациями и BibTeX. Источник — знания LLM (агент работает в
+  изолированной сети без доступа к публичному arXiv).
 
 inputs:
   topic:
@@ -18,16 +18,16 @@ inputs:
   max_papers:
     type: number
     label: "Сколько статей"
-    default: 20
+    default: 15
     min: 5
-    max: 50
+    max: 30
   language:
     type: radio
-    label: "Язык запроса"
+    label: "Язык аннотаций"
     options:
-      - { value: "ru", label: "Русский (переведём в EN для arXiv)" }
+      - { value: "ru", label: "Русский" }
       - { value: "en", label: "Английский" }
-    default: "en"
+    default: "ru"
 
 files: {}
 
