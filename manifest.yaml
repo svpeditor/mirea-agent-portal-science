@@ -1,0 +1,59 @@
+id: science-agent
+name: "Поиск научных статей"
+version: "1.0.0"
+category: "научная-работа"
+icon: "🔬"
+short_description: |
+  По теме исследования ищет статьи в arXiv (опционально обогащает через
+  Semantic Scholar), ранжирует и аннотирует через DeepSeek-R1,
+  формирует Word-отчёт и BibTeX.
+
+inputs:
+  topic:
+    type: textarea
+    label: "Тема исследования"
+    placeholder: "например, machine learning для медицинской диагностики"
+    rows: 4
+    required: true
+  max_papers:
+    type: number
+    label: "Сколько статей"
+    default: 20
+    min: 5
+    max: 50
+  language:
+    type: radio
+    label: "Язык запроса"
+    options:
+      - { value: "ru", label: "Русский (переведём в EN для arXiv)" }
+      - { value: "en", label: "Английский" }
+    default: "en"
+
+files: {}
+
+outputs:
+  - id: report
+    type: docx
+    label: "Отчёт по теме"
+    filename: "report.docx"
+    primary: true
+  - id: bibtex
+    type: any
+    label: "BibTeX источников"
+    filename: "sources.bib"
+
+runtime:
+  docker:
+    base_image: "python:3.12-slim"
+    setup:
+      - "pip install -r requirements.txt"
+    entrypoint: ["python", "agent.py"]
+  limits:
+    max_runtime_minutes: 30
+    max_memory_mb: 512
+    max_cpu_cores: 1
+  llm:
+    provider: openrouter
+    models:
+      - "deepseek/deepseek-r1"
+      - "anthropic/claude-haiku-4-5-20251001"
