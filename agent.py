@@ -1,17 +1,12 @@
-"""science-agent — поиск научных статей по теме через DeepSeek-R1.
+"""science-agent — поиск научных статей по теме.
 
-ВАЖНО: агенты на платформе запускаются в изолированной docker-сети
-(internal=true), у них нет доступа в публичный интернет (arXiv API,
-Semantic Scholar). Доступен только LLM-прокси portal-api.
-
-Поэтому работаем целиком через LLM:
-- Просим DeepSeek-R1 предложить N релевантных публикаций из своих знаний.
-- Получаем JSON с title/authors/year/venue/arxiv_id/annotation.
-- Рисуем report.docx + sources.bib.
-
-Это демо-уровень: статьи могут быть выдуманными. Real-production
-вариант — прокинуть arXiv API через прокси portal-api отдельным
-endpoint-ом (вне scope wave0).
+Два режима:
+1. **arxiv** (default) — портал-api прокидывает запрос в export.arxiv.org
+   через /api/sandbox/arxiv (allowlist-proxy), DeepSeek-R1 ранжирует
+   результаты и пишет аннотации на русском. Реальные статьи, реальные
+   arxiv_id.
+2. **llm** — fallback на знания LLM (если sandbox-endpoint недоступен,
+   или хочется быстро без сетевого запроса).
 """
 from __future__ import annotations
 
@@ -147,6 +142,92 @@ def _llm_papers(topic: str, n: int, language: str, model: str, api_key: str, bas
     return papers
 
 
+def _arxiv_search(query: str, max_results: int, api_key: str, base_url: str) -> list[Paper]:
+    """Дёргает /api/sandbox/arxiv на portal-api (или совместимом URL).
+
+    base_url — это OPENROUTER_BASE_URL, т.е. URL LLM-прокси на portal-api
+    вида http://api:8000/llm/v1. Нам нужен корень portal-api без /llm/v1 —
+    оттуда уже /api/sandbox/arxiv. Корень вычисляем грубо: убираем /llm/v1.
+    """
+    base = base_url.rstrip("/")
+    if base.endswith("/llm/v1"):
+        base = base[: -len("/llm/v1")]
+    url = f"{base}/api/sandbox/arxiv"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    with httpx.Client(timeout=60) as client:
+        r = client.get(url, params={"search_query": query, "max_results": max_results}, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+
+    papers: list[Paper] = []
+    for row in data.get("papers", []):
+        papers.append(Paper(
+            title=row.get("title", ""),
+            authors=row.get("authors", []),
+            year=row.get("year"),
+            venue="arXiv",
+            arxiv_id=row.get("arxiv_id"),
+            url=row.get("url"),
+            annotation="",  # потом дополним LLM
+        ))
+    return papers
+
+
+def _llm_rank_and_annotate(
+    topic: str,
+    papers: list[Paper],
+    language: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+) -> list[Paper]:
+    """Послать список abstracts в LLM, получить score + краткую аннотацию."""
+    if not papers:
+        return papers
+    ann_lang = "русском" if language == "ru" else "английском"
+    items = [
+        {"i": i, "title": p.title, "year": p.year, "authors": p.authors[:3]}
+        for i, p in enumerate(papers)
+    ]
+    system = (
+        "Ты — научный библиограф. Получишь тему и список статей. "
+        f"Для каждой статьи оцени релевантность (0..1) и напиши краткую аннотацию "
+        f"на {ann_lang} (1-2 предложения). Отвечай строго JSON-массивом."
+    )
+    user = (
+        f"Тема: {topic}\n\nСтатьи: {json.dumps(items, ensure_ascii=False)}\n\n"
+        'Верни JSON: [{"i":<idx>,"score":<0..1>,"annotation":"..."},...]. '
+        "Сортировка по убыванию score. Без markdown, только массив."
+    )
+    raw = _llm_call(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        model=model, api_key=api_key, base_url=base_url, max_tokens=4000,
+    )
+    parsed = _parse_json(raw)
+    if not isinstance(parsed, list):
+        return papers
+
+    ranked: list[Paper] = []
+    seen: set[int] = set()
+    for row in parsed:
+        if not isinstance(row, dict):
+            continue
+        idx = row.get("i")
+        if not isinstance(idx, int) or idx < 0 or idx >= len(papers):
+            continue
+        if idx in seen:
+            continue
+        seen.add(idx)
+        p = papers[idx]
+        p.score = float(row.get("score", 0.0) or 0.0)
+        p.annotation = str(row.get("annotation", ""))
+        ranked.append(p)
+    for i, p in enumerate(papers):
+        if i not in seen:
+            ranked.append(p)
+    return ranked
+
+
 def _build_bibtex(papers: list[Paper]) -> str:
     out: list[str] = []
     for p in papers:
@@ -206,10 +287,10 @@ def main() -> None:
     topic: str = (params.get("topic") or "").strip()
     max_papers: int = max(5, min(30, int(params.get("max_papers", 15))))
     language: str = params.get("language", "en")
+    source: str = (params.get("source") or "arxiv").lower()
 
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     base_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip()
-    # Приоритет: param → env → default (claude-haiku быстрый).
     model = (
         params.get("model")
         or os.environ.get("LLM_MODEL")
@@ -223,22 +304,47 @@ def main() -> None:
         agent.failed("Не указана тема.")
         return
 
-    agent.log("info", f"science: topic={topic[:80]!r}, max_papers={max_papers}, language={language}, model={model}")
-    if "deepseek" in model.lower() and "r1" in model.lower():
-        agent.log("info", "DeepSeek-R1 — reasoning-модель, обычно отвечает 1-4 минуты. Терпение.")
-    agent.progress(0.1, f"Запрос к {model} на подбор публикаций")
+    agent.log(
+        "info",
+        f"science: topic={topic[:80]!r}, max_papers={max_papers}, "
+        f"language={language}, model={model}, source={source}",
+    )
 
-    try:
-        papers = _llm_papers(topic, max_papers, language, model, api_key, base_url)
-    except httpx.HTTPStatusError as e:
-        agent.failed(f"LLM ответил {e.response.status_code}: {e.response.text[:200]}")
-        return
-    except Exception as e:  # noqa: BLE001
-        agent.failed(f"LLM не вернула валидный JSON: {e}")
-        return
+    papers: list[Paper] = []
+    if source == "arxiv":
+        agent.progress(0.1, "Запрос в arXiv через portal-api proxy")
+        try:
+            papers = _arxiv_search(topic, max_papers, api_key, base_url)
+        except httpx.HTTPStatusError as e:
+            agent.log("warn", f"arXiv proxy ответил {e.response.status_code}, переключаюсь на LLM-режим")
+            source = "llm"
+        except Exception as e:  # noqa: BLE001
+            agent.log("warn", f"arXiv proxy недоступен ({e}), переключаюсь на LLM-режим")
+            source = "llm"
+
+        if papers:
+            agent.log("info", f"arXiv вернул {len(papers)} статей, отправляю в {model} на ранжирование")
+            agent.progress(0.5, f"{model} оценивает релевантность и пишет аннотации")
+            try:
+                papers = _llm_rank_and_annotate(topic, papers, language, model, api_key, base_url)
+            except Exception as e:  # noqa: BLE001
+                agent.log("warn", f"LLM ранжирование сорвалось ({e}); идём с arXiv-порядком")
+
+    if source == "llm" or not papers:
+        if "deepseek" in model.lower() and "r1" in model.lower():
+            agent.log("info", "DeepSeek-R1 — reasoning-модель, обычно отвечает 1-4 минуты. Терпение.")
+        agent.progress(0.1, f"Запрос к {model} на подбор публикаций из знаний модели")
+        try:
+            papers = _llm_papers(topic, max_papers, language, model, api_key, base_url)
+        except httpx.HTTPStatusError as e:
+            agent.failed(f"LLM ответил {e.response.status_code}: {e.response.text[:200]}")
+            return
+        except Exception as e:  # noqa: BLE001
+            agent.failed(f"LLM не вернула валидный JSON: {e}")
+            return
 
     if not papers:
-        agent.failed("LLM не вернула ни одной публикации — переформулируй тему.")
+        agent.failed("Не удалось найти ни одной публикации — переформулируй тему.")
         return
 
     for p in papers:

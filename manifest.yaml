@@ -1,13 +1,12 @@
 id: science-agent
 name: "Поиск научных статей"
-version: "1.3.0"
+version: "2.0.0"
 category: "научная-работа"
 icon: "🔬"
 short_description: |
-  По теме исследования спрашивает у DeepSeek-R1 список релевантных публикаций
-  с краткими аннотациями и BibTeX. Источник — знания модели (агент работает
-  в изолированной сети без доступа к публичному arXiv). DeepSeek-R1 — reasoning-
-  модель, обычно отвечает 1-4 минуты — это нормально.
+  По теме ищет статьи в arXiv через allowlist-прокси portal-api,
+  ранжирует и аннотирует через DeepSeek-R1. Возвращает Word-отчёт + BibTeX.
+  Источник = arxiv (реальные статьи) или llm (знания модели, fallback).
 
 inputs:
   topic:
@@ -29,13 +28,21 @@ inputs:
       - { value: "ru", label: "Русский" }
       - { value: "en", label: "Английский" }
     default: "ru"
+  source:
+    type: radio
+    label: "Источник публикаций"
+    help: "arXiv — реальные статьи через прокси portal-api. LLM — подбор из знаний модели (быстрее, но может содержать ошибки)."
+    options:
+      - { value: "arxiv", label: "arXiv (рекомендуется)" }
+      - { value: "llm", label: "Знания LLM (fallback)" }
+    default: "arxiv"
   model:
     type: radio
-    label: "Модель"
-    help: "R1 — reasoning-модель, отвечает 1-4 минуты но даёт более точные подборки. Haiku — быстро (10-30с) но проще."
+    label: "Модель для ранжирования и аннотаций"
+    help: "R1 — reasoning-модель, отвечает 1-4 минуты но точнее. Haiku — быстро (10-30с)."
     options:
       - { value: "deepseek/deepseek-r1", label: "DeepSeek-R1 (рекомендуется, 1-4 мин)" }
-      - { value: "anthropic/claude-3.5-haiku", label: "Claude 3.5 Haiku (быстро, проще)" }
+      - { value: "anthropic/claude-3.5-haiku", label: "Claude 3.5 Haiku (быстро)" }
     default: "deepseek/deepseek-r1"
 
 files: {}
