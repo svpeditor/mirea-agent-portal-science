@@ -31,6 +31,10 @@ class Paper:
     url: str | None
     annotation: str
     score: float = 0.0
+    score_explanation: str = ""
+    pdf_url: str | None = None
+    doi: str | None = None
+    citation_count: int = 0
 
     @property
     def bibkey(self) -> str:
@@ -142,17 +146,25 @@ def _llm_papers(topic: str, n: int, language: str, model: str, api_key: str, bas
     return papers
 
 
-def _arxiv_search(query: str, max_results: int, api_key: str, base_url: str) -> list[Paper]:
-    """Дёргает /api/sandbox/arxiv на portal-api (или совместимом URL).
-
-    base_url — это OPENROUTER_BASE_URL, т.е. URL LLM-прокси на portal-api
-    вида http://api:8000/llm/v1. Нам нужен корень portal-api без /llm/v1 —
-    оттуда уже /api/sandbox/arxiv. Корень вычисляем грубо: убираем /llm/v1.
-    """
+def _sandbox_root(base_url: str) -> str:
+    """Корень portal-api для sandbox endpoints (base_url = LLM-прокси)."""
     base = base_url.rstrip("/")
     if base.endswith("/llm/v1"):
         base = base[: -len("/llm/v1")]
-    url = f"{base}/api/sandbox/arxiv"
+    return base
+
+
+def _arxiv_pdf_url(arxiv_id: str | None) -> str | None:
+    """arxiv:1706.03762v5 → https://arxiv.org/pdf/1706.03762v5.pdf"""
+    if not arxiv_id:
+        return None
+    aid = arxiv_id.replace("arxiv:", "")
+    return f"https://arxiv.org/pdf/{aid}.pdf"
+
+
+def _arxiv_search(query: str, max_results: int, api_key: str, base_url: str) -> list[Paper]:
+    """Дёргает /api/sandbox/arxiv на portal-api (или совместимом URL)."""
+    url = f"{_sandbox_root(base_url)}/api/sandbox/arxiv"
     headers = {"Authorization": f"Bearer {api_key}"}
     with httpx.Client(timeout=60) as client:
         r = client.get(url, params={"search_query": query, "max_results": max_results}, headers=headers)
@@ -161,15 +173,48 @@ def _arxiv_search(query: str, max_results: int, api_key: str, base_url: str) -> 
 
     papers: list[Paper] = []
     for row in data.get("papers", []):
+        aid = row.get("arxiv_id")
         papers.append(Paper(
             title=row.get("title", ""),
             authors=row.get("authors", []),
             year=row.get("year"),
             venue="arXiv",
-            arxiv_id=row.get("arxiv_id"),
+            arxiv_id=aid,
             url=row.get("url"),
             annotation="",  # потом дополним LLM
+            pdf_url=_arxiv_pdf_url(aid),
         ))
+    return papers
+
+
+def _enrich_via_s2(papers: list[Paper], topic: str, api_key: str, base_url: str) -> list[Paper]:
+    """Достаём citation counts + DOI + abstracts из Semantic Scholar.
+
+    Делаем ОДИН запрос по `topic`, сопоставляем по нормализованному названию.
+    Если статья нашлась — заполняем citation_count, doi, удлиняем abstract
+    в annotation если он пустой.
+    """
+    url = f"{_sandbox_root(base_url)}/api/sandbox/semantic-scholar"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        with httpx.Client(timeout=30) as client:
+            r = client.get(url, params={"query": topic, "limit": 50}, headers=headers)
+            r.raise_for_status()
+            s2 = r.json().get("papers", [])
+    except Exception:  # noqa: BLE001
+        return papers
+
+    def _norm(t: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (t or "").lower())
+
+    by_title = {_norm(p["title"]): p for p in s2 if p.get("title")}
+    for p in papers:
+        match = by_title.get(_norm(p.title))
+        if match:
+            p.citation_count = int(match.get("citation_count") or 0)
+            p.doi = match.get("doi") or p.doi
+            if not p.annotation and match.get("abstract"):
+                p.annotation = match["abstract"][:600]
     return papers
 
 
@@ -181,27 +226,35 @@ def _llm_rank_and_annotate(
     api_key: str,
     base_url: str,
 ) -> list[Paper]:
-    """Послать список abstracts в LLM, получить score + краткую аннотацию."""
+    """LLM: score (0..1) + аннотация (~5 предложений) + объяснение балла."""
     if not papers:
         return papers
     ann_lang = "русском" if language == "ru" else "английском"
     items = [
-        {"i": i, "title": p.title, "year": p.year, "authors": p.authors[:3]}
+        {
+            "i": i,
+            "title": p.title,
+            "year": p.year,
+            "authors": p.authors[:3],
+            "abstract": (p.annotation or "")[:600],  # S2 abstract если есть
+        }
         for i, p in enumerate(papers)
     ]
     system = (
         "Ты — научный библиограф. Получишь тему и список статей. "
-        f"Для каждой статьи оцени релевантность (0..1) и напиши краткую аннотацию "
-        f"на {ann_lang} (1-2 предложения). Отвечай строго JSON-массивом."
+        f"Для каждой статьи: (1) поставь score 0..1 (соответствие теме), "
+        f"(2) напиши аннотацию на {ann_lang} ~5 предложений, "
+        "(3) объясни в 1-2 предложениях почему именно такой score. "
+        "Отвечай строго JSON-массивом, без markdown."
     )
     user = (
         f"Тема: {topic}\n\nСтатьи: {json.dumps(items, ensure_ascii=False)}\n\n"
-        'Верни JSON: [{"i":<idx>,"score":<0..1>,"annotation":"..."},...]. '
-        "Сортировка по убыванию score. Без markdown, только массив."
+        'Верни JSON: [{"i":<idx>,"score":<0..1>,"annotation":"...","score_explanation":"..."},...]. '
+        "Сортировка по убыванию score."
     )
     raw = _llm_call(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        model=model, api_key=api_key, base_url=base_url, max_tokens=4000,
+        model=model, api_key=api_key, base_url=base_url, max_tokens=6000,
     )
     parsed = _parse_json(raw)
     if not isinstance(parsed, list):
@@ -220,7 +273,10 @@ def _llm_rank_and_annotate(
         seen.add(idx)
         p = papers[idx]
         p.score = float(row.get("score", 0.0) or 0.0)
-        p.annotation = str(row.get("annotation", ""))
+        new_ann = str(row.get("annotation", "")).strip()
+        if new_ann:
+            p.annotation = new_ann
+        p.score_explanation = str(row.get("score_explanation", "")).strip()
         ranked.append(p)
     for i, p in enumerate(papers):
         if i not in seen:
@@ -270,13 +326,21 @@ def _build_report(topic: str, papers: list[Paper], model: str) -> Document:
             meta_parts.append(p.venue)
         if p.arxiv_id:
             meta_parts.append(f"arXiv:{p.arxiv_id}")
+        if p.doi:
+            meta_parts.append(f"DOI:{p.doi}")
+        if p.citation_count:
+            meta_parts.append(f"цитирований: {p.citation_count}")
         if p.score:
             meta_parts.append(f"релевантность {p.score:.2f}")
         if meta_parts:
             doc.add_paragraph("  •  ".join(meta_parts))
         if p.annotation:
             doc.add_paragraph(f"Аннотация: {p.annotation}")
-        if p.url:
+        if p.score_explanation:
+            doc.add_paragraph(f"Почему такой балл: {p.score_explanation}")
+        if p.pdf_url:
+            doc.add_paragraph(f"Скачать PDF: {p.pdf_url}")
+        elif p.url:
             doc.add_paragraph(f"URL: {p.url}")
     return doc
 
@@ -288,6 +352,7 @@ def main() -> None:
     max_papers: int = max(5, min(30, int(params.get("max_papers", 15))))
     language: str = params.get("language", "en")
     source: str = (params.get("source") or "arxiv").lower()
+    sort_by: str = (params.get("sort_by") or "relevance").lower()
 
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     base_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip()
@@ -307,7 +372,7 @@ def main() -> None:
     agent.log(
         "info",
         f"science: topic={topic[:80]!r}, max_papers={max_papers}, "
-        f"language={language}, model={model}, source={source}",
+        f"language={language}, model={model}, source={source}, sort={sort_by}",
     )
 
     papers: list[Paper] = []
@@ -323,7 +388,13 @@ def main() -> None:
             source = "llm"
 
         if papers:
-            agent.log("info", f"arXiv вернул {len(papers)} статей, отправляю в {model} на ранжирование")
+            agent.log("info", f"arXiv вернул {len(papers)} статей, обогащаю через Semantic Scholar")
+            agent.progress(0.35, "Semantic Scholar: citations + DOI + abstracts")
+            try:
+                papers = _enrich_via_s2(papers, topic, api_key, base_url)
+            except Exception as e:  # noqa: BLE001
+                agent.log("warn", f"S2 enrichment не удался ({e}), идём дальше")
+
             agent.progress(0.5, f"{model} оценивает релевантность и пишет аннотации")
             try:
                 papers = _llm_rank_and_annotate(topic, papers, language, model, api_key, base_url)
@@ -346,6 +417,12 @@ def main() -> None:
     if not papers:
         agent.failed("Не удалось найти ни одной публикации — переформулируй тему.")
         return
+
+    # Финальная сортировка
+    if sort_by == "popularity":
+        papers.sort(key=lambda p: (-p.citation_count, -p.score))
+    else:
+        papers.sort(key=lambda p: (-p.score, -p.citation_count))
 
     for p in papers:
         agent.item_done(

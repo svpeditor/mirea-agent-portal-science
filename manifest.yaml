@@ -1,6 +1,6 @@
 id: science-agent
 name: "Поиск научных статей"
-version: "2.0.0"
+version: "3.0.0"
 category: "научная-работа"
 icon: "🔬"
 short_description: |
@@ -36,6 +36,13 @@ inputs:
       - { value: "arxiv", label: "arXiv (рекомендуется)" }
       - { value: "llm", label: "Знания LLM (fallback)" }
     default: "arxiv"
+  sort_by:
+    type: radio
+    label: "Сортировка"
+    options:
+      - { value: "relevance", label: "По релевантности (LLM-балл)" }
+      - { value: "popularity", label: "По цитированиям (Semantic Scholar)" }
+    default: "relevance"
   model:
     type: radio
     label: "Модель для ранжирования и аннотаций"
