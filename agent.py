@@ -203,7 +203,12 @@ def main() -> None:
 
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     base_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip()
-    model = os.environ.get("LLM_MODEL", "deepseek/deepseek-r1").strip()
+    # Приоритет: param → env → default (claude-haiku быстрый).
+    model = (
+        params.get("model")
+        or os.environ.get("LLM_MODEL")
+        or "anthropic/claude-haiku-4-5-20251001"
+    ).strip()
 
     if not api_key:
         agent.failed("OPENROUTER_API_KEY не передан.")
@@ -213,7 +218,9 @@ def main() -> None:
         return
 
     agent.log("info", f"science: topic={topic[:80]!r}, max_papers={max_papers}, language={language}, model={model}")
-    agent.progress(0.1, "Запрос к DeepSeek-R1 на подбор публикаций")
+    if "deepseek" in model.lower() and "r1" in model.lower():
+        agent.log("info", "DeepSeek-R1 — reasoning-модель, обычно отвечает 1-4 минуты. Терпение.")
+    agent.progress(0.1, f"Запрос к {model} на подбор публикаций")
 
     try:
         papers = _llm_papers(topic, max_papers, language, model, api_key, base_url)
