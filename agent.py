@@ -207,7 +207,7 @@ def main() -> None:
     model = (
         params.get("model")
         or os.environ.get("LLM_MODEL")
-        or "anthropic/claude-haiku-4-5-20251001"
+        or "anthropic/claude-3.5-haiku"
     ).strip()
 
     if not api_key:

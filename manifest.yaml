@@ -34,9 +34,9 @@ inputs:
     label: "Модель"
     help: "Haiku — быстрее (10-30с), R1 — рассуждает дольше но иногда точнее (1-4 мин)."
     options:
-      - { value: "anthropic/claude-haiku-4-5-20251001", label: "Claude Haiku (быстро)" }
+      - { value: "anthropic/claude-3.5-haiku", label: "Claude 3.5 Haiku (быстро)" }
       - { value: "deepseek/deepseek-r1", label: "DeepSeek-R1 (медленно)" }
-    default: "anthropic/claude-haiku-4-5-20251001"
+    default: "anthropic/claude-3.5-haiku"
 
 files: {}
 
@@ -65,4 +65,4 @@ runtime:
     provider: openrouter
     models:
       - "deepseek/deepseek-r1"
-      - "anthropic/claude-haiku-4-5-20251001"
+      - "anthropic/claude-3.5-haiku"
