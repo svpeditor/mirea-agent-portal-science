@@ -39,9 +39,15 @@ class Paper:
 
     @property
     def bibkey(self) -> str:
-        first_author = (self.authors[0].split()[-1] if self.authors else "anon").lower()
-        first_author = re.sub(r"[^a-z0-9]", "", first_author) or "anon"
-        return f"{first_author}{self.year or 'nd'}_{re.sub(r'[^A-Za-z0-9]', '', self.title)[:20].lower()}"
+        # Берём самое длинное «слово» в первом авторе как фамилию.
+        # У "Vaswani A." это Vaswani, у "A. Vaswani" — тоже Vaswani.
+        parts = (self.authors[0] if self.authors else "anon").split()
+        if parts:
+            surname = max(parts, key=len)
+        else:
+            surname = "anon"
+        surname = re.sub(r"[^a-z0-9]", "", surname.lower()) or "anon"
+        return f"{surname}{self.year or 'nd'}_{re.sub(r'[^A-Za-z0-9]', '', self.title)[:20].lower()}"
 
 
 def _llm_call(messages: list[dict], model: str, api_key: str, base_url: str, *, max_tokens: int = 8000) -> str:
