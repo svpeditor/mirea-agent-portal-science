@@ -1,12 +1,25 @@
-"""science-agent — поиск научных статей по теме.
+"""science-agent — поиск РЕАЛЬНЫХ научных статей по теме.
 
-Два режима:
-1. **arxiv** (default) — портал-api прокидывает запрос в export.arxiv.org
-   через /api/sandbox/arxiv (allowlist-proxy), DeepSeek-R1 ранжирует
-   результаты и пишет аннотации на русском. Реальные статьи, реальные
-   arxiv_id.
-2. **llm** — fallback на знания LLM (если sandbox-endpoint недоступен,
-   или хочется быстро без сетевого запроса).
+Принцип: агент НИКОГДА не выдумывает публикации. Он ищет в реальных
+индексах через allowlist-прокси portal-api и работает только с тем, что
+там реально нашлось:
+
+- arXiv          (/api/sandbox/arxiv)            — препринты STEM
+- Crossref       (/api/sandbox/crossref)         — DOI-журналы, в т.ч.
+                                                   русско-/гуманитарные
+- Semantic Scholar (/api/sandbox/semantic-scholar) — abstracts + цитируемость
+
+Результаты трёх источников объединяются и дедуплицируются. LLM
+используется ТОЛЬКО чтобы оценить релевантность реальных статей и
+написать аннотации по их реальным abstract'ам — не для генерации списка.
+
+Режим `llm` существует, но он ЯВНЫЙ: каждая запись помечается «НЕ
+ПРОВЕРЕНО», и отчёт несёт крупное предупреждение. Если реальный поиск
+ничего не дал — агент честно завершается с ошибкой, а НЕ подменяет
+выдачу галлюцинацией.
+
+Для реально найденных arXiv-статей агент скачивает сам PDF (через
+/api/sandbox/arxiv-pdf) в output/pdfs/, чтобы файл сохранился у портала.
 """
 from __future__ import annotations
 
@@ -19,6 +32,11 @@ import httpx
 from docx import Document
 
 from portal_sdk import Agent
+
+MAX_PDF_DOWNLOADS = 10  # сколько верхних статей качать файлом
+# Совокупный бюджет PDF: заведомо ниже portal max_job_output_bytes (1 GiB),
+# чтобы report.docx/sources.bib всегда сохранились, даже если PDF большие.
+MAX_PDF_TOTAL_BYTES = 200 * 1024 * 1024
 
 
 @dataclass
@@ -35,27 +53,29 @@ class Paper:
     pdf_url: str | None = None
     doi: str | None = None
     citation_count: int = 0
+    provenance: list[str] = field(default_factory=list)  # ['arXiv','Crossref',...]
+    unverified: bool = False  # True только в явном LLM-режиме
+    pdf_filename: str | None = None  # имя файла в output/pdfs/ если скачали
 
     @property
     def bibkey(self) -> str:
-        # Берём самое длинное «слово» в первом авторе как фамилию.
-        # У "Vaswani A." это Vaswani, у "A. Vaswani" — тоже Vaswani.
         parts = (self.authors[0] if self.authors else "anon").split()
-        if parts:
-            surname = max(parts, key=len)
-        else:
-            surname = "anon"
+        surname = max(parts, key=len) if parts else "anon"
         surname = re.sub(r"[^a-z0-9]", "", surname.lower()) or "anon"
         return f"{surname}{self.year or 'nd'}_{re.sub(r'[^A-Za-z0-9]', '', self.title)[:20].lower()}"
 
+    @property
+    def best_link(self) -> str | None:
+        aid = _norm_arxiv_id(self.arxiv_id)
+        if aid:
+            return f"https://arxiv.org/abs/{aid}"
+        if self.doi:
+            return f"https://doi.org/{self.doi}"
+        return self.url
+
 
 def _llm_call(messages: list[dict], model: str, api_key: str, base_url: str, *, max_tokens: int = 8000) -> str:
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.3,
-        "max_tokens": max_tokens,
-    }
+    payload = {"model": model, "messages": messages, "temperature": 0.3, "max_tokens": max_tokens}
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -84,191 +104,216 @@ def _parse_json(s: str):
     return json.loads(s)
 
 
-def _llm_papers(topic: str, n: int, language: str, model: str, api_key: str, base_url: str) -> list[Paper]:
-    system = (
-        "Ты — научный библиограф. По теме исследования предложишь публикации "
-        "из своих знаний (arXiv, ведущие конференции). Аннотации пиши кратко и информативно. "
-        "Отвечай строго JSON-массивом, без markdown, без пояснений."
-    )
-    ann_lang = "Аннотации — на русском." if language == "ru" else "Annotations — in English."
-    user = f"""Тема: {topic}
+def _norm_title(t: str) -> str:
+    return re.sub(r"[^a-zа-я0-9]+", "", (t or "").lower())
 
-Подбери {n} наиболее релевантных публикаций. {ann_lang}
 
-Формат — JSON-массив объектов, отранжированный по релевантности:
-[
-  {{
-    "title": "<точное название>",
-    "authors": ["<Фамилия И.О.>", "..."],
-    "year": <YYYY>,
-    "venue": "<arXiv/conference/journal>",
-    "arxiv_id": "<arxiv-id если знаешь, иначе null>",
-    "url": "<https://... если знаешь, иначе null>",
-    "annotation": "<1-2 предложения: о чём работа и почему релевантна теме>",
-    "score": <0..1, релевантность теме>
-  }}
-]
-
-Только массив, ничего больше."""
-    raw = _llm_call(
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        model=model, api_key=api_key, base_url=base_url, max_tokens=8000,
-    )
-    parsed = _parse_json(raw)
-    if not isinstance(parsed, list):
-        raise ValueError("LLM вернула не массив")
-
-    papers: list[Paper] = []
-    for row in parsed:
-        if not isinstance(row, dict):
-            continue
-        title = str(row.get("title", "")).strip()
-        if not title:
-            continue
-        authors_raw = row.get("authors", [])
-        authors = [str(a) for a in authors_raw if a] if isinstance(authors_raw, list) else []
-        year = row.get("year")
-        try:
-            year = int(year) if year is not None else None
-        except (TypeError, ValueError):
-            year = None
-        papers.append(Paper(
-            title=title,
-            authors=authors,
-            year=year,
-            venue=str(row.get("venue", "")),
-            arxiv_id=row.get("arxiv_id") or None,
-            url=row.get("url") or None,
-            annotation=str(row.get("annotation", "")),
-            score=float(row.get("score", 0.0) or 0.0),
-        ))
-    papers.sort(key=lambda p: -p.score)
-    return papers
+def _strip_jats(s: str) -> str:
+    """Crossref abstract приходит JATS-XML — выкидываем теги."""
+    return re.sub(r"<[^>]+>", " ", s or "").strip()
 
 
 def _sandbox_root(base_url: str) -> str:
-    """Корень portal-api для sandbox endpoints (base_url = LLM-прокси)."""
     base = base_url.rstrip("/")
     if base.endswith("/llm/v1"):
         base = base[: -len("/llm/v1")]
     return base
 
 
-def _arxiv_pdf_url(arxiv_id: str | None) -> str | None:
-    """arxiv:1706.03762v5 → https://arxiv.org/pdf/1706.03762v5.pdf"""
-    if not arxiv_id:
+def _norm_arxiv_id(s: str | None) -> str | None:
+    """Единственная точка нормализации arxiv_id: срезаем префикс `arxiv:`
+    и пробелы. Используется везде (ingest/ссылки/скачивание)."""
+    if not s:
         return None
-    aid = arxiv_id.replace("arxiv:", "")
-    return f"https://arxiv.org/pdf/{aid}.pdf"
+    out = re.sub(r"(?i)^arxiv:", "", s).strip()
+    return out or None
 
 
-def _arxiv_search(query: str, max_results: int, api_key: str, base_url: str) -> list[Paper]:
-    """Дёргает /api/sandbox/arxiv на portal-api (или совместимом URL)."""
-    url = f"{_sandbox_root(base_url)}/api/sandbox/arxiv"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    with httpx.Client(timeout=60) as client:
-        r = client.get(url, params={"search_query": query, "max_results": max_results}, headers=headers)
-        r.raise_for_status()
-        data = r.json()
+def _surname(authors: list[str]) -> str:
+    parts = (authors[0] if authors else "").split()
+    return max(parts, key=len).lower() if parts else ""
 
-    papers: list[Paper] = []
+
+def _arxiv_pdf_url(arxiv_id: str | None) -> str | None:
+    aid = _norm_arxiv_id(arxiv_id)
+    return f"https://arxiv.org/pdf/{aid}.pdf" if aid else None
+
+
+# --- Реальные источники через sandbox-прокси ---
+
+def _get_json(client: httpx.Client, url: str, params: dict, api_key: str) -> dict:
+    r = client.get(url, params=params, headers={"Authorization": f"Bearer {api_key}"})
+    r.raise_for_status()
+    return r.json()
+
+
+def _search_arxiv(topic: str, n: int, api_key: str, root: str) -> list[Paper]:
+    out: list[Paper] = []
+    with httpx.Client(timeout=60) as c:
+        data = _get_json(c, f"{root}/api/sandbox/arxiv",
+                         {"search_query": topic, "max_results": n}, api_key)
     for row in data.get("papers", []):
-        aid = row.get("arxiv_id")
-        papers.append(Paper(
-            title=row.get("title", ""),
-            authors=row.get("authors", []),
-            year=row.get("year"),
-            venue="arXiv",
-            arxiv_id=aid,
-            url=row.get("url"),
-            annotation="",  # потом дополним LLM
-            pdf_url=_arxiv_pdf_url(aid),
+        aid = _norm_arxiv_id(row.get("arxiv_id"))
+        out.append(Paper(
+            title=row.get("title", ""), authors=row.get("authors", []),
+            year=row.get("year"), venue="arXiv", arxiv_id=aid,
+            url=row.get("url"), annotation=_strip_jats(row.get("abstract", "")),
+            pdf_url=_arxiv_pdf_url(aid), provenance=["arXiv"],
         ))
+    return out
+
+
+def _search_crossref(topic: str, n: int, api_key: str, root: str) -> list[Paper]:
+    out: list[Paper] = []
+    with httpx.Client(timeout=60) as c:
+        data = _get_json(c, f"{root}/api/sandbox/crossref",
+                         {"query": topic, "rows": n}, api_key)
+    for row in data.get("works", []):
+        out.append(Paper(
+            title=row.get("title", ""), authors=row.get("authors", []),
+            year=row.get("year"), venue=row.get("venue", ""), arxiv_id=None,
+            url=row.get("url"), annotation=_strip_jats(row.get("abstract", "")),
+            doi=row.get("doi"), citation_count=int(row.get("citation_count") or 0),
+            provenance=["Crossref"],
+        ))
+    return out
+
+
+def _search_s2(topic: str, n: int, api_key: str, root: str) -> list[Paper]:
+    out: list[Paper] = []
+    with httpx.Client(timeout=60) as c:
+        data = _get_json(c, f"{root}/api/sandbox/semantic-scholar",
+                         {"query": topic, "limit": n}, api_key)
+    for row in data.get("papers", []):
+        aid = _norm_arxiv_id(row.get("arxiv_id"))
+        out.append(Paper(
+            title=row.get("title", ""), authors=row.get("authors", []),
+            year=row.get("year"), venue=row.get("venue", ""), arxiv_id=aid,
+            url=row.get("url"), annotation=_strip_jats(row.get("abstract", "")),
+            doi=row.get("doi"), citation_count=int(row.get("citation_count") or 0),
+            pdf_url=_arxiv_pdf_url(aid), provenance=["Semantic Scholar"],
+        ))
+    return out
+
+
+def _merge(groups: list[list[Paper]]) -> list[Paper]:
+    """Дедуп. Сильное тождество — DOI: тогда сливаем И идентификаторы.
+    Слабое — нормализованное название + год + фамилия первого автора:
+    тогда сливаем ТОЛЬКО provenance и описательные поля, идентификаторы
+    (arxiv_id/doi/url/pdf_url) НЕ заимствуем — иначе можно подвесить чужой
+    PDF к статье (misattribution)."""
+    by_key: dict[str, Paper] = {}
+    for group in groups:
+        for p in group:
+            if not p.title.strip():
+                continue
+            doi = (p.doi or "").strip().lower()
+            if doi:
+                key, strong = f"doi:{doi}", True
+            else:
+                nt = _norm_title(p.title)
+                if not nt:
+                    continue
+                key = f"t:{nt}|{p.year or ''}|{_surname(p.authors)}"
+                strong = False
+            if key not in by_key:
+                by_key[key] = p
+                continue
+            ex = by_key[key]
+            for src in p.provenance:
+                if src not in ex.provenance:
+                    ex.provenance.append(src)
+            ex.year = ex.year or p.year
+            ex.venue = ex.venue or p.venue
+            ex.citation_count = max(ex.citation_count, p.citation_count)
+            if len(p.annotation) > len(ex.annotation):
+                ex.annotation = p.annotation
+            if len(p.authors) > len(ex.authors):
+                ex.authors = p.authors
+            if strong:  # только при совпадении по DOI безопасно сливать ID
+                ex.arxiv_id = ex.arxiv_id or p.arxiv_id
+                ex.doi = ex.doi or p.doi
+                ex.url = ex.url or p.url
+                ex.pdf_url = ex.pdf_url or p.pdf_url
+    return list(by_key.values())
+
+
+def _llm_papers(topic: str, n: int, language: str, model: str, api_key: str, base_url: str) -> list[Paper]:
+    """ЯВНЫЙ LLM-режим. Каждая запись помечается unverified=True."""
+    ann_lang = "Аннотации — на русском." if language == "ru" else "Annotations — in English."
+    system = (
+        "Ты — научный библиограф. По теме предложи публикации из своих знаний. "
+        "Отвечай строго JSON-массивом, без markdown."
+    )
+    user = (
+        f"Тема: {topic}\n\nПодбери {n} релевантных публикаций. {ann_lang}\n"
+        'JSON-массив: [{"title","authors":[..],"year","venue","arxiv_id"|null,'
+        '"url"|null,"annotation","score":0..1}]. Только массив.'
+    )
+    parsed = _parse_json(_llm_call(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        model=model, api_key=api_key, base_url=base_url, max_tokens=8000,
+    ))
+    if not isinstance(parsed, list):
+        raise ValueError("LLM вернула не массив")
+    papers: list[Paper] = []
+    for row in parsed:
+        if not isinstance(row, dict) or not str(row.get("title", "")).strip():
+            continue
+        year = row.get("year")
+        try:
+            year = int(year) if year is not None else None
+        except (TypeError, ValueError):
+            year = None
+        papers.append(Paper(
+            title=str(row["title"]).strip(),
+            authors=[str(a) for a in row.get("authors", []) if a],
+            year=year, venue=str(row.get("venue", "")),
+            arxiv_id=row.get("arxiv_id") or None, url=row.get("url") or None,
+            annotation=str(row.get("annotation", "")),
+            score=float(row.get("score", 0.0) or 0.0),
+            provenance=["LLM (не проверено)"], unverified=True,
+        ))
+    papers.sort(key=lambda p: -p.score)
     return papers
 
 
-def _enrich_via_s2(papers: list[Paper], topic: str, api_key: str, base_url: str) -> list[Paper]:
-    """Достаём citation counts + DOI + abstracts из Semantic Scholar.
-
-    Делаем ОДИН запрос по `topic`, сопоставляем по нормализованному названию.
-    Если статья нашлась — заполняем citation_count, doi, удлиняем abstract
-    в annotation если он пустой.
-    """
-    url = f"{_sandbox_root(base_url)}/api/sandbox/semantic-scholar"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    try:
-        with httpx.Client(timeout=30) as client:
-            r = client.get(url, params={"query": topic, "limit": 50}, headers=headers)
-            r.raise_for_status()
-            s2 = r.json().get("papers", [])
-    except Exception:  # noqa: BLE001
-        return papers
-
-    def _norm(t: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", (t or "").lower())
-
-    by_title = {_norm(p["title"]): p for p in s2 if p.get("title")}
-    for p in papers:
-        match = by_title.get(_norm(p.title))
-        if match:
-            p.citation_count = int(match.get("citation_count") or 0)
-            p.doi = match.get("doi") or p.doi
-            if not p.annotation and match.get("abstract"):
-                p.annotation = match["abstract"][:600]
-    return papers
-
-
-def _llm_rank_and_annotate(
-    topic: str,
-    papers: list[Paper],
-    language: str,
-    model: str,
-    api_key: str,
-    base_url: str,
-) -> list[Paper]:
-    """LLM: score (0..1) + аннотация (~5 предложений) + объяснение балла."""
+def _llm_rank_and_annotate(topic, papers, language, model, api_key, base_url) -> list[Paper]:
+    """LLM оценивает РЕАЛЬНЫЕ статьи и пишет аннотации по их abstract'ам.
+    Не добавляет и не удаляет статьи — только score/annotation/explanation."""
     if not papers:
         return papers
     ann_lang = "русском" if language == "ru" else "английском"
     items = [
-        {
-            "i": i,
-            "title": p.title,
-            "year": p.year,
-            "authors": p.authors[:3],
-            "abstract": (p.annotation or "")[:600],  # S2 abstract если есть
-        }
+        {"i": i, "title": p.title, "year": p.year, "authors": p.authors[:3],
+         "abstract": (p.annotation or "")[:600]}
         for i, p in enumerate(papers)
     ]
     system = (
-        "Ты — научный библиограф. Получишь тему и список статей. "
-        f"Для каждой статьи: (1) поставь score 0..1 (соответствие теме), "
-        f"(2) напиши аннотацию на {ann_lang} ~5 предложений, "
-        "(3) объясни в 1-2 предложениях почему именно такой score. "
-        "Отвечай строго JSON-массивом, без markdown."
+        "Ты — научный библиограф. Дан список РЕАЛЬНЫХ статей. Для каждой: "
+        f"(1) score 0..1 релевантности теме, (2) аннотация на {ann_lang} ~5 "
+        "предложений строго по приведённому abstract (не выдумывай фактов), "
+        "(3) объяснение балла 1-2 предложения. Строго JSON-массив."
     )
     user = (
         f"Тема: {topic}\n\nСтатьи: {json.dumps(items, ensure_ascii=False)}\n\n"
-        'Верни JSON: [{"i":<idx>,"score":<0..1>,"annotation":"...","score_explanation":"..."},...]. '
-        "Сортировка по убыванию score."
+        'Верни [{"i","score","annotation","score_explanation"}]. Без markdown.'
     )
-    raw = _llm_call(
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        model=model, api_key=api_key, base_url=base_url, max_tokens=6000,
-    )
-    parsed = _parse_json(raw)
+    try:
+        parsed = _parse_json(_llm_call(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=model, api_key=api_key, base_url=base_url, max_tokens=6000,
+        ))
+    except Exception:  # noqa: BLE001
+        return papers  # LLM сорвалась — отдаём реальные статьи как есть
     if not isinstance(parsed, list):
         return papers
-
-    ranked: list[Paper] = []
     seen: set[int] = set()
     for row in parsed:
         if not isinstance(row, dict):
             continue
         idx = row.get("i")
-        if not isinstance(idx, int) or idx < 0 or idx >= len(papers):
-            continue
-        if idx in seen:
+        if not isinstance(idx, int) or idx < 0 or idx >= len(papers) or idx in seen:
             continue
         seen.add(idx)
         p = papers[idx]
@@ -277,11 +322,41 @@ def _llm_rank_and_annotate(
         if new_ann:
             p.annotation = new_ann
         p.score_explanation = str(row.get("score_explanation", "")).strip()
-        ranked.append(p)
-    for i, p in enumerate(papers):
-        if i not in seen:
-            ranked.append(p)
-    return ranked
+    return papers
+
+
+def _download_pdfs(agent: Agent, papers: list[Paper], api_key: str, root: str) -> None:
+    """Качаем PDF верхних arXiv-статей в output/pdfs/ через sandbox-прокси."""
+    pdf_dir = agent.output_dir / "pdfs"
+    done = 0
+    total = 0
+    for p in papers:
+        if done >= MAX_PDF_DOWNLOADS or total >= MAX_PDF_TOTAL_BYTES:
+            break
+        aid = _norm_arxiv_id(p.arxiv_id)
+        if not aid:
+            continue
+        try:
+            with httpx.Client(timeout=90) as c:
+                r = c.get(f"{root}/api/sandbox/arxiv-pdf",
+                          params={"arxiv_id": aid},
+                          headers={"Authorization": f"Bearer {api_key}"})
+            if r.status_code != 200:
+                agent.log("warn", f"PDF {aid}: прокси {r.status_code}, оставляю ссылку")
+                continue
+            if total + len(r.content) > MAX_PDF_TOTAL_BYTES:
+                agent.log("warn", f"PDF {aid}: превышен общий бюджет, оставляю ссылку")
+                break
+            pdf_dir.mkdir(parents=True, exist_ok=True)
+            fname = f"{re.sub(r'[^A-Za-z0-9._-]', '_', aid)}.pdf"
+            (pdf_dir / fname).write_bytes(r.content)
+            p.pdf_filename = f"pdfs/{fname}"
+            done += 1
+            total += len(r.content)
+        except Exception as e:  # noqa: BLE001
+            agent.log("warn", f"PDF {aid}: не скачал ({e}), оставляю ссылку")
+    if done:
+        agent.log("info", f"Скачано PDF-файлов: {done} ({total // 1024} КБ)")
 
 
 def _build_bibtex(papers: list[Paper]) -> str:
@@ -297,51 +372,77 @@ def _build_bibtex(papers: list[Paper]) -> str:
             fields.append(f"  journal = {{{p.venue}}}")
         if p.arxiv_id:
             fields.append(f"  eprint = {{arxiv:{p.arxiv_id}}}")
+        if p.doi:
+            fields.append(f"  doi = {{{p.doi}}}")
         if p.url:
             fields.append(f"  url = {{{p.url}}}")
         out.append("@article{" + p.bibkey + ",\n" + ",\n".join(fields) + "\n}\n")
     return "\n".join(out)
 
 
-def _build_report(topic: str, papers: list[Paper], model: str) -> Document:
+def _build_report(topic: str, papers: list[Paper], model: str, *, unverified: bool = False) -> Document:
     doc = Document()
     doc.add_heading("Поиск научных статей — отчёт", level=0)
     doc.add_paragraph(f"Тема: {topic}")
     doc.add_paragraph(f"Всего статей: {len(papers)}")
     doc.add_paragraph(f"Модель: {model}")
-    doc.add_paragraph(
-        "Подбор сделан LLM на основе её знаний. Перепроверьте цитирования "
-        "перед использованием — LLM может ошибаться в датах и идентификаторах."
-    )
+
+    if unverified:
+        w = doc.add_paragraph()
+        run = w.add_run(
+            "ВНИМАНИЕ: список подобран языковой моделью из её знаний и НЕ "
+            "ПРОВЕРЕН по реальным базам. Возможны несуществующие статьи и "
+            "неверные идентификаторы. Перепроверьте каждый источник перед "
+            "использованием."
+        )
+        run.bold = True
+    else:
+        srcs = sorted({s for p in papers for s in p.provenance})
+        doc.add_paragraph(
+            "Все статьи ниже — реальные записи из баз: "
+            + (", ".join(srcs) if srcs else "—")
+            + ". Ссылки кликабельны; для arXiv-статей PDF приложен файлом."
+        )
 
     doc.add_heading("Ранжированный список", level=1)
     for i, p in enumerate(papers, start=1):
         doc.add_heading(f"{i}. {p.title}", level=2)
+        if p.unverified:
+            r = doc.add_paragraph().add_run("НЕ ПРОВЕРЕНО — предложено моделью")
+            r.bold = True
         if p.authors:
-            doc.add_paragraph(f"Авторы: {', '.join(p.authors[:6])}{' и др.' if len(p.authors) > 6 else ''}")
-        meta_parts = []
+            doc.add_paragraph(
+                f"Авторы: {', '.join(p.authors[:6])}"
+                f"{' и др.' if len(p.authors) > 6 else ''}"
+            )
+        meta = []
         if p.year:
-            meta_parts.append(str(p.year))
+            meta.append(str(p.year))
         if p.venue:
-            meta_parts.append(p.venue)
+            meta.append(p.venue)
         if p.arxiv_id:
-            meta_parts.append(f"arXiv:{p.arxiv_id}")
+            meta.append(f"arXiv:{p.arxiv_id}")
         if p.doi:
-            meta_parts.append(f"DOI:{p.doi}")
+            meta.append(f"DOI:{p.doi}")
         if p.citation_count:
-            meta_parts.append(f"цитирований: {p.citation_count}")
+            meta.append(f"цитирований: {p.citation_count}")
         if p.score:
-            meta_parts.append(f"релевантность {p.score:.2f}")
-        if meta_parts:
-            doc.add_paragraph("  •  ".join(meta_parts))
+            meta.append(f"релевантность {p.score:.2f}")
+        if p.provenance:
+            meta.append("источник: " + ", ".join(p.provenance))
+        if meta:
+            doc.add_paragraph("  •  ".join(meta))
         if p.annotation:
             doc.add_paragraph(f"Аннотация: {p.annotation}")
         if p.score_explanation:
             doc.add_paragraph(f"Почему такой балл: {p.score_explanation}")
-        if p.pdf_url:
-            doc.add_paragraph(f"Скачать PDF: {p.pdf_url}")
-        elif p.url:
-            doc.add_paragraph(f"URL: {p.url}")
+        link = p.best_link
+        if link:
+            doc.add_paragraph(f"Ссылка: {link}")
+        if p.pdf_filename:
+            doc.add_paragraph(f"Файл статьи: {p.pdf_filename}")
+        elif p.arxiv_id and p.pdf_url:
+            doc.add_paragraph(f"PDF: {p.pdf_url}")
     return doc
 
 
@@ -350,17 +451,16 @@ def main() -> None:
     params = agent.params
     topic: str = (params.get("topic") or "").strip()
     max_papers: int = max(5, min(30, int(params.get("max_papers", 15))))
-    language: str = params.get("language", "en")
-    source: str = (params.get("source") or "arxiv").lower()
+    language: str = params.get("language", "ru")
+    raw_source: str = (params.get("source") or "real").lower()
+    # back-compat: старое значение 'arxiv' = реальный поиск
+    source = "llm" if raw_source == "llm" else "real"
     sort_by: str = (params.get("sort_by") or "relevance").lower()
 
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     base_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip()
-    model = (
-        params.get("model")
-        or os.environ.get("LLM_MODEL")
-        or "deepseek/deepseek-r1"
-    ).strip()
+    model = (params.get("model") or os.environ.get("LLM_MODEL") or "deepseek/deepseek-r1").strip()
+    root = _sandbox_root(base_url)
 
     if not api_key:
         agent.failed("OPENROUTER_API_KEY не передан.")
@@ -369,42 +469,54 @@ def main() -> None:
         agent.failed("Не указана тема.")
         return
 
-    agent.log(
-        "info",
-        f"science: topic={topic[:80]!r}, max_papers={max_papers}, "
-        f"language={language}, model={model}, source={source}, sort={sort_by}",
-    )
+    agent.log("info", f"science: topic={topic[:80]!r}, max={max_papers}, "
+                       f"lang={language}, model={model}, source={source}, sort={sort_by}")
 
     papers: list[Paper] = []
-    if source == "arxiv":
-        agent.progress(0.1, "Запрос в arXiv через portal-api proxy")
-        try:
-            papers = _arxiv_search(topic, max_papers, api_key, base_url)
-        except httpx.HTTPStatusError as e:
-            agent.log("warn", f"arXiv proxy ответил {e.response.status_code}, переключаюсь на LLM-режим")
-            source = "llm"
-        except Exception as e:  # noqa: BLE001
-            agent.log("warn", f"arXiv proxy недоступен ({e}), переключаюсь на LLM-режим")
-            source = "llm"
+    unverified = False
 
-        if papers:
-            agent.log("info", f"arXiv вернул {len(papers)} статей, обогащаю через Semantic Scholar")
-            agent.progress(0.35, "Semantic Scholar: citations + DOI + abstracts")
+    if source == "real":
+        per_src = max_papers
+        groups: list[list[Paper]] = []
+        errors: list[str] = []
+        for name, fn in (("arXiv", _search_arxiv),
+                         ("Crossref", _search_crossref),
+                         ("Semantic Scholar", _search_s2)):
+            agent.progress(0.15, f"Поиск: {name}")
             try:
-                papers = _enrich_via_s2(papers, topic, api_key, base_url)
+                res = fn(topic, per_src, api_key, root)
+                agent.log("info", f"{name}: найдено {len(res)}")
+                groups.append(res)
             except Exception as e:  # noqa: BLE001
-                agent.log("warn", f"S2 enrichment не удался ({e}), идём дальше")
+                errors.append(f"{name}: {e}")
+                agent.log("warn", f"{name} недоступен: {e}")
 
-            agent.progress(0.5, f"{model} оценивает релевантность и пишет аннотации")
-            try:
-                papers = _llm_rank_and_annotate(topic, papers, language, model, api_key, base_url)
-            except Exception as e:  # noqa: BLE001
-                agent.log("warn", f"LLM ранжирование сорвалось ({e}); идём с arXiv-порядком")
-
-    if source == "llm" or not papers:
-        if "deepseek" in model.lower() and "r1" in model.lower():
-            agent.log("info", "DeepSeek-R1 — reasoning-модель, обычно отвечает 1-4 минуты. Терпение.")
-        agent.progress(0.1, f"Запрос к {model} на подбор публикаций из знаний модели")
+        papers = _merge(groups)
+        if not papers:
+            # ЧЕСТНЫЙ отказ — НЕ подменяем галлюцинацией. Различаем
+            # «инфраструктура недоступна» и «реально 0 результатов»,
+            # иначе препод снова решит что агент «не умеет в русские темы».
+            if not groups and errors:
+                agent.failed(
+                    "Источники поиска недоступны (ни один не ответил), это "
+                    "сбой инфраструктуры, а не отсутствие статей по теме. "
+                    "Повторите запуск позже. Детали: " + "; ".join(errors)
+                )
+            else:
+                detail = "; ".join(errors) if errors else "все источники вернули 0 результатов"
+                agent.failed(
+                    "По теме не найдено реальных публикаций в arXiv / Crossref "
+                    "/ Semantic Scholar. Уточните формулировку (попробуйте "
+                    "ключевые слова по-английски) либо явно выберите источник "
+                    f"«Знания LLM», понимая что он не проверен. Детали: {detail}"
+                )
+            return
+        agent.progress(0.5, f"{model}: оценка релевантности и аннотации")
+        papers = _llm_rank_and_annotate(topic, papers, language, model, api_key, base_url)
+    else:
+        unverified = True
+        agent.log("warn", "ЯВНЫЙ LLM-режим: статьи НЕ проверяются по реальным базам.")
+        agent.progress(0.2, f"{model}: подбор из знаний модели (не проверено)")
         try:
             papers = _llm_papers(topic, max_papers, language, model, api_key, base_url)
         except httpx.HTTPStatusError as e:
@@ -413,27 +525,28 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001
             agent.failed(f"LLM не вернула валидный JSON: {e}")
             return
+        if not papers:
+            agent.failed("LLM не предложила ни одной публикации — переформулируй тему.")
+            return
 
-    if not papers:
-        agent.failed("Не удалось найти ни одной публикации — переформулируй тему.")
-        return
-
-    # Финальная сортировка
     if sort_by == "popularity":
         papers.sort(key=lambda p: (-p.citation_count, -p.score))
     else:
         papers.sort(key=lambda p: (-p.score, -p.citation_count))
+    papers = papers[:max_papers]
+
+    if source == "real":
+        agent.progress(0.8, "Скачиваю PDF реально найденных arXiv-статей")
+        _download_pdfs(agent, papers, api_key, root)
 
     for p in papers:
-        agent.item_done(
-            p.arxiv_id or p.title[:40],
-            summary=p.title,
-            data={"year": p.year, "venue": p.venue, "score": p.score},
-        )
+        agent.item_done(p.arxiv_id or p.doi or p.title[:40], summary=p.title,
+                        data={"year": p.year, "venue": p.venue, "score": p.score,
+                              "unverified": p.unverified})
 
-    agent.progress(0.85, "Формируем report.docx и sources.bib")
+    agent.progress(0.92, "Формирую report.docx и sources.bib")
     out_dir = agent.output_dir
-    _build_report(topic, papers, model).save(out_dir / "report.docx")
+    _build_report(topic, papers, model, unverified=unverified).save(out_dir / "report.docx")
     (out_dir / "sources.bib").write_text(_build_bibtex(papers), encoding="utf-8")
 
     agent.progress(1.0, "Готово")

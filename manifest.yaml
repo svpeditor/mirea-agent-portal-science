@@ -1,12 +1,16 @@
 id: science-agent
 name: "Поиск научных статей"
-version: "3.0.0"
+version: "4.0.0"
 category: "научная-работа"
 icon: "🔬"
 short_description: |
-  По теме ищет статьи в arXiv через allowlist-прокси portal-api,
-  ранжирует и аннотирует через DeepSeek-R1. Возвращает Word-отчёт + BibTeX.
-  Источник = arxiv (реальные статьи) или llm (знания модели, fallback).
+  Ищет РЕАЛЬНЫЕ статьи по теме сразу в трёх базах (arXiv + Crossref +
+  Semantic Scholar) через allowlist-прокси portal-api, дедуплицирует,
+  ранжирует и аннотирует через DeepSeek-R1 строго по реальным abstract'ам.
+  Для arXiv-статей прикладывает сам PDF-файл. Кликабельные ссылки + BibTeX.
+  Crossref покрывает русско-/гуманитарные журналы (не только STEM).
+  Агент НЕ выдумывает статьи: если реального ничего не нашлось — честно
+  сообщает об этом, а не подменяет выдачу фантазией модели.
 
 inputs:
   topic:
@@ -31,11 +35,11 @@ inputs:
   source:
     type: radio
     label: "Источник публикаций"
-    help: "arXiv — реальные статьи через прокси portal-api. LLM — подбор из знаний модели (быстрее, но может содержать ошибки)."
+    help: "Реальные базы — настоящие статьи (arXiv+Crossref+Semantic Scholar), с ссылками и PDF. Знания LLM — модель подбирает из памяти, статьи НЕ проверяются и могут быть выдуманы (только если реальный поиск не подошёл)."
     options:
-      - { value: "arxiv", label: "arXiv (рекомендуется)" }
-      - { value: "llm", label: "Знания LLM (fallback)" }
-    default: "arxiv"
+      - { value: "real", label: "Реальные базы (рекомендуется)" }
+      - { value: "llm", label: "Знания LLM (не проверено!)" }
+    default: "real"
   sort_by:
     type: radio
     label: "Сортировка"
