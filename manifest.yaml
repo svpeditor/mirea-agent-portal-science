@@ -1,16 +1,17 @@
 id: science-agent
 name: "Поиск научных статей"
-version: "4.0.0"
+version: "5.0.0"
 category: "научная-работа"
 icon: "🔬"
 short_description: |
-  Ищет РЕАЛЬНЫЕ статьи по теме сразу в трёх базах (arXiv + Crossref +
-  Semantic Scholar) через allowlist-прокси portal-api, дедуплицирует,
-  ранжирует и аннотирует через DeepSeek-R1 строго по реальным abstract'ам.
-  Для arXiv-статей прикладывает сам PDF-файл. Кликабельные ссылки + BibTeX.
-  Crossref покрывает русско-/гуманитарные журналы (не только STEM).
-  Агент НЕ выдумывает статьи: если реального ничего не нашлось — честно
-  сообщает об этом, а не подменяет выдачу фантазией модели.
+  Ищет РЕАЛЬНЫЕ статьи по теме сразу в пяти базах (CyberLeninka + arXiv +
+  Crossref + Semantic Scholar + OpenAlex) через allowlist-прокси portal-api.
+  LLM генерирует поисковые запросы (рус.+англ.), затем дедуплицирует,
+  ранжирует и аннотирует найденное строго по реальным abstract'ам.
+  CyberLeninka даёт русскоязычные журналы, OpenAlex — широкое покрытие.
+  PDF открытого доступа (arXiv, CyberLeninka, OA по DOI) прикладывает
+  файлами. Кликабельные ссылки + BibTeX. Агент НЕ выдумывает статьи: если
+  реального ничего не нашлось — честно сообщает, а не фантазирует.
 
 inputs:
   topic:
@@ -19,6 +20,11 @@ inputs:
     placeholder: "например, machine learning для медицинской диагностики"
     rows: 4
     required: true
+  description:
+    type: textarea
+    label: "Описание (необязательно)"
+    placeholder: "уточните контекст: подзадачи, методы, период - поможет точнее подобрать запросы"
+    rows: 3
   max_papers:
     type: number
     label: "Сколько статей"
@@ -32,14 +38,11 @@ inputs:
       - { value: "ru", label: "Русский" }
       - { value: "en", label: "Английский" }
     default: "ru"
-  source:
-    type: radio
-    label: "Источник публикаций"
-    help: "Реальные базы — настоящие статьи (arXiv+Crossref+Semantic Scholar), с ссылками и PDF. Знания LLM — модель подбирает из памяти, статьи НЕ проверяются и могут быть выдуманы (только если реальный поиск не подошёл)."
-    options:
-      - { value: "real", label: "Реальные базы (рекомендуется)" }
-      - { value: "llm", label: "Знания LLM (не проверено!)" }
-    default: "real"
+  download_pdf:
+    type: checkbox
+    label: "Скачивать PDF открытого доступа"
+    help: "Прикладывает файлы статей из открытых источников (arXiv, CyberLeninka, OA по DOI). Только легально открытые версии."
+    default: true
   sort_by:
     type: radio
     label: "Сортировка"

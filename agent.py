@@ -1,31 +1,30 @@
 """science-agent — поиск РЕАЛЬНЫХ научных статей по теме.
 
-Принцип: агент НИКОГДА не выдумывает публикации. Он ищет в реальных
-индексах через allowlist-прокси portal-api и работает только с тем, что
-там реально нашлось:
+Принцип: агент НИКОГДА не выдумывает публикации. LLM используется только
+чтобы (1) сгенерировать поисковые запросы, (2) оценить релевантность реально
+найденных статей и перевести/написать аннотации по их реальным abstract'ам.
+Сами статьи всегда берутся из реальных индексов через allowlist-прокси
+portal-api:
 
-- arXiv          (/api/sandbox/arxiv)            — препринты STEM
-- Crossref       (/api/sandbox/crossref)         — DOI-журналы, в т.ч.
-                                                   русско-/гуманитарные
-- Semantic Scholar (/api/sandbox/semantic-scholar) — abstracts + цитируемость
+- CyberLeninka     (/api/sandbox/cyberleninka)      — русскоязычные журналы
+- arXiv            (/api/sandbox/arxiv)             — препринты STEM
+- Crossref         (/api/sandbox/crossref)          — DOI-журналы
+- Semantic Scholar (/api/sandbox/semantic-scholar)  — abstracts + цитируемость
+- OpenAlex         (/api/sandbox/openalex)          — широкое покрытие + OA
 
-Результаты трёх источников объединяются и дедуплицируются. LLM
-используется ТОЛЬКО чтобы оценить релевантность реальных статей и
-написать аннотации по их реальным abstract'ам — не для генерации списка.
+Результаты всех источников по всем запросам объединяются и дедуплицируются.
+Если реальный поиск ничего не дал — агент честно завершается с ошибкой, а НЕ
+подменяет выдачу галлюцинацией (никакого «режима знаний LLM»).
 
-Режим `llm` существует, но он ЯВНЫЙ: каждая запись помечается «НЕ
-ПРОВЕРЕНО», и отчёт несёт крупное предупреждение. Если реальный поиск
-ничего не дал — агент честно завершается с ошибкой, а НЕ подменяет
-выдачу галлюцинацией.
-
-Для реально найденных arXiv-статей агент скачивает сам PDF (через
-/api/sandbox/arxiv-pdf) в output/pdfs/, чтобы файл сохранился у портала.
+PDF открытого доступа (arXiv, CyberLeninka, OA по DOI через Unpaywall)
+скачивается в output/pdfs/. Только легально открытые версии.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 
 import httpx
@@ -37,6 +36,9 @@ MAX_PDF_DOWNLOADS = 10  # сколько верхних статей качат�
 # Совокупный бюджет PDF: заведомо ниже portal max_job_output_bytes (1 GiB),
 # чтобы report.docx/sources.bib всегда сохранились, даже если PDF большие.
 MAX_PDF_TOTAL_BYTES = 200 * 1024 * 1024
+MAX_QUERIES = 5            # сколько поисковых запросов генерим
+RESULTS_PER_QUERY = 10     # сколько результатов берём из каждого источника на запрос
+MAX_FOR_ANALYSIS = 40      # сколько верхних статей отправляем на LLM-оценку
 
 
 @dataclass
@@ -52,9 +54,9 @@ class Paper:
     score_explanation: str = ""
     pdf_url: str | None = None
     doi: str | None = None
+    cl_slug: str | None = None  # slug статьи CyberLeninka (для скачивания PDF)
     citation_count: int = 0
-    provenance: list[str] = field(default_factory=list)  # ['arXiv','Crossref',...]
-    unverified: bool = False  # True только в явном LLM-режиме
+    provenance: list[str] = field(default_factory=list)  # ['arXiv','CyberLeninka',...]
     pdf_filename: str | None = None  # имя файла в output/pdfs/ если скачали
 
     @property
@@ -62,7 +64,14 @@ class Paper:
         parts = (self.authors[0] if self.authors else "anon").split()
         surname = max(parts, key=len) if parts else "anon"
         surname = re.sub(r"[^a-z0-9]", "", surname.lower()) or "anon"
-        return f"{surname}{self.year or 'nd'}_{re.sub(r'[^A-Za-z0-9]', '', self.title)[:20].lower()}"
+        # ASCII-срез заголовка; для кириллических заголовков он пуст, поэтому
+        # берём запасной идентификатор (arxiv/doi/slug), чтобы ключи не
+        # схлопывались в одинаковый «фамилияГод_».
+        slug = re.sub(r"[^A-Za-z0-9]", "", self.title)[:20].lower()
+        if not slug:
+            alt = self.arxiv_id or self.doi or self.cl_slug or ""
+            slug = re.sub(r"[^a-z0-9]", "", alt.lower())[:16]
+        return f"{surname}{self.year or 'nd'}_{slug}"
 
     @property
     def best_link(self) -> str | None:
@@ -108,6 +117,10 @@ def _norm_title(t: str) -> str:
     return re.sub(r"[^a-zа-я0-9]+", "", (t or "").lower())
 
 
+def _has_cyrillic(s: str) -> bool:
+    return bool(re.search(r"[а-яА-Я]", s or ""))
+
+
 def _strip_jats(s: str) -> str:
     """Crossref abstract приходит JATS-XML — выкидываем теги."""
     return re.sub(r"<[^>]+>", " ", s or "").strip()
@@ -139,6 +152,39 @@ def _arxiv_pdf_url(arxiv_id: str | None) -> str | None:
     return f"https://arxiv.org/pdf/{aid}.pdf" if aid else None
 
 
+# --- Генерация поисковых запросов через LLM ---
+
+def _gen_queries(topic: str, description: str, model: str, api_key: str, base_url: str) -> list[str]:
+    """LLM генерит короткие запросы RU+EN. На сбое — fallback на саму тему."""
+    system = (
+        "Ты — эксперт по научному информационному поиску. Сгенерируй короткие "
+        "(2-6 слов) поисковые запросы для научных баз. Часть на РУССКОМ (для "
+        "CyberLeninka), часть на АНГЛИЙСКОМ (для международных баз). И широкие, "
+        "и узкие. Ответь строго JSON без markdown: {\"queries\": [\"запрос\", ...]}"
+    )
+    desc = f"Описание: {description}" if description else "Описание не дано."
+    user = f"Тема: {topic}\n{desc}\nСгенерируй {MAX_QUERIES} запросов."
+    try:
+        data = _parse_json(_llm_call(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=model, api_key=api_key, base_url=base_url, max_tokens=2000,
+        ))
+        raw = data.get("queries", []) if isinstance(data, dict) else data
+        out: list[str] = []
+        for q in raw:
+            q = str(q).strip()
+            if q and q.lower() not in {x.lower() for x in out}:
+                out.append(q)
+        out = out[:MAX_QUERIES]
+        if out:
+            if topic not in out:
+                out.insert(0, topic)
+            return out[:MAX_QUERIES]
+    except Exception:  # noqa: BLE001
+        pass
+    return [topic]
+
+
 # --- Реальные источники через sandbox-прокси ---
 
 def _get_json(client: httpx.Client, url: str, params: dict, api_key: str) -> dict:
@@ -147,11 +193,11 @@ def _get_json(client: httpx.Client, url: str, params: dict, api_key: str) -> dic
     return r.json()
 
 
-def _search_arxiv(topic: str, n: int, api_key: str, root: str) -> list[Paper]:
+def _search_arxiv(query: str, n: int, api_key: str, root: str) -> list[Paper]:
     out: list[Paper] = []
     with httpx.Client(timeout=60) as c:
         data = _get_json(c, f"{root}/api/sandbox/arxiv",
-                         {"search_query": topic, "max_results": n}, api_key)
+                         {"search_query": query, "max_results": n}, api_key)
     for row in data.get("papers", []):
         aid = _norm_arxiv_id(row.get("arxiv_id"))
         out.append(Paper(
@@ -163,11 +209,11 @@ def _search_arxiv(topic: str, n: int, api_key: str, root: str) -> list[Paper]:
     return out
 
 
-def _search_crossref(topic: str, n: int, api_key: str, root: str) -> list[Paper]:
+def _search_crossref(query: str, n: int, api_key: str, root: str) -> list[Paper]:
     out: list[Paper] = []
     with httpx.Client(timeout=60) as c:
         data = _get_json(c, f"{root}/api/sandbox/crossref",
-                         {"query": topic, "rows": n}, api_key)
+                         {"query": query, "rows": n}, api_key)
     for row in data.get("works", []):
         out.append(Paper(
             title=row.get("title", ""), authors=row.get("authors", []),
@@ -179,11 +225,11 @@ def _search_crossref(topic: str, n: int, api_key: str, root: str) -> list[Paper]
     return out
 
 
-def _search_s2(topic: str, n: int, api_key: str, root: str) -> list[Paper]:
+def _search_s2(query: str, n: int, api_key: str, root: str) -> list[Paper]:
     out: list[Paper] = []
     with httpx.Client(timeout=60) as c:
         data = _get_json(c, f"{root}/api/sandbox/semantic-scholar",
-                         {"query": topic, "limit": n}, api_key)
+                         {"query": query, "limit": n}, api_key)
     for row in data.get("papers", []):
         aid = _norm_arxiv_id(row.get("arxiv_id"))
         out.append(Paper(
@@ -196,12 +242,55 @@ def _search_s2(topic: str, n: int, api_key: str, root: str) -> list[Paper]:
     return out
 
 
+def _search_cyberleninka(query: str, n: int, api_key: str, root: str) -> list[Paper]:
+    out: list[Paper] = []
+    with httpx.Client(timeout=60) as c:
+        data = _get_json(c, f"{root}/api/sandbox/cyberleninka",
+                         {"query": query, "size": n}, api_key)
+    for row in data.get("articles", []):
+        out.append(Paper(
+            title=row.get("title", ""), authors=row.get("authors", []),
+            year=row.get("year"), venue=row.get("journal", ""), arxiv_id=None,
+            url=row.get("url"), annotation=row.get("abstract", ""),
+            cl_slug=row.get("slug") or None, pdf_url=row.get("pdf_url") or None,
+            provenance=["CyberLeninka"],
+        ))
+    return out
+
+
+def _search_openalex(query: str, n: int, api_key: str, root: str) -> list[Paper]:
+    out: list[Paper] = []
+    with httpx.Client(timeout=60) as c:
+        data = _get_json(c, f"{root}/api/sandbox/openalex",
+                         {"query": query, "per_page": n}, api_key)
+    for row in data.get("works", []):
+        out.append(Paper(
+            title=row.get("title", ""), authors=row.get("authors", []),
+            year=row.get("year"), venue=row.get("venue", ""), arxiv_id=None,
+            url=row.get("url"), annotation=row.get("abstract", ""),
+            doi=row.get("doi"), citation_count=int(row.get("citation_count") or 0),
+            pdf_url=row.get("oa_url") if row.get("is_oa") else None,
+            provenance=["OpenAlex"],
+        ))
+    return out
+
+
+# (source_name, fn, only_cyrillic_queries)
+_SOURCES = (
+    ("CyberLeninka", _search_cyberleninka, True),
+    ("arXiv", _search_arxiv, False),
+    ("Crossref", _search_crossref, False),
+    ("Semantic Scholar", _search_s2, False),
+    ("OpenAlex", _search_openalex, False),
+)
+
+
 def _merge(groups: list[list[Paper]]) -> list[Paper]:
     """Дедуп. Сильное тождество — DOI: тогда сливаем И идентификаторы.
     Слабое — нормализованное название + год + фамилия первого автора:
     тогда сливаем ТОЛЬКО provenance и описательные поля, идентификаторы
-    (arxiv_id/doi/url/pdf_url) НЕ заимствуем — иначе можно подвесить чужой
-    PDF к статье (misattribution)."""
+    (arxiv_id/doi/url/pdf_url/cl_slug) НЕ заимствуем — иначе можно подвесить
+    чужой PDF к статье (misattribution)."""
     by_key: dict[str, Paper] = {}
     for group in groups:
         for p in group:
@@ -235,47 +324,24 @@ def _merge(groups: list[list[Paper]]) -> list[Paper]:
                 ex.doi = ex.doi or p.doi
                 ex.url = ex.url or p.url
                 ex.pdf_url = ex.pdf_url or p.pdf_url
+                ex.cl_slug = ex.cl_slug or p.cl_slug
     return list(by_key.values())
 
 
-def _llm_papers(topic: str, n: int, language: str, model: str, api_key: str, base_url: str) -> list[Paper]:
-    """ЯВНЫЙ LLM-режим. Каждая запись помечается unverified=True."""
-    ann_lang = "Аннотации — на русском." if language == "ru" else "Annotations — in English."
-    system = (
-        "Ты — научный библиограф. По теме предложи публикации из своих знаний. "
-        "Отвечай строго JSON-массивом, без markdown."
-    )
-    user = (
-        f"Тема: {topic}\n\nПодбери {n} релевантных публикаций. {ann_lang}\n"
-        'JSON-массив: [{"title","authors":[..],"year","venue","arxiv_id"|null,'
-        '"url"|null,"annotation","score":0..1}]. Только массив.'
-    )
-    parsed = _parse_json(_llm_call(
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        model=model, api_key=api_key, base_url=base_url, max_tokens=8000,
-    ))
-    if not isinstance(parsed, list):
-        raise ValueError("LLM вернула не массив")
-    papers: list[Paper] = []
-    for row in parsed:
-        if not isinstance(row, dict) or not str(row.get("title", "")).strip():
-            continue
-        year = row.get("year")
-        try:
-            year = int(year) if year is not None else None
-        except (TypeError, ValueError):
-            year = None
-        papers.append(Paper(
-            title=str(row["title"]).strip(),
-            authors=[str(a) for a in row.get("authors", []) if a],
-            year=year, venue=str(row.get("venue", "")),
-            arxiv_id=row.get("arxiv_id") or None, url=row.get("url") or None,
-            annotation=str(row.get("annotation", "")),
-            score=float(row.get("score", 0.0) or 0.0),
-            provenance=["LLM (не проверено)"], unverified=True,
-        ))
-    papers.sort(key=lambda p: -p.score)
-    return papers
+def _prelim_rank(papers: list[Paper]) -> list[Paper]:
+    """Эвристика до LLM-анализа: свежесть + цитируемость + наличие аннотации."""
+    def s(p: Paper) -> float:
+        v = 0.0
+        if p.citation_count:
+            v += min(p.citation_count / 100, 10)
+        if p.annotation:
+            v += 2
+        if p.year and p.year >= 2020:
+            v += 3
+        elif p.year and p.year >= 2015:
+            v += 1
+        return v
+    return sorted(papers, key=s, reverse=True)
 
 
 def _llm_rank_and_annotate(topic, papers, language, model, api_key, base_url) -> list[Paper]:
@@ -326,7 +392,11 @@ def _llm_rank_and_annotate(topic, papers, language, model, api_key, base_url) ->
 
 
 def _download_pdfs(agent: Agent, papers: list[Paper], api_key: str, root: str) -> None:
-    """Качаем PDF верхних arXiv-статей в output/pdfs/ через sandbox-прокси."""
+    """Качаем PDF открытого доступа в output/pdfs/ через sandbox-прокси.
+
+    Приоритет источника: arXiv -> CyberLeninka -> OA по DOI (Unpaywall).
+    Только легально открытые версии; на любой проблеме оставляем ссылку.
+    """
     pdf_dir = agent.output_dir / "pdfs"
     done = 0
     total = 0
@@ -334,34 +404,52 @@ def _download_pdfs(agent: Agent, papers: list[Paper], api_key: str, root: str) -
         if done >= MAX_PDF_DOWNLOADS or total >= MAX_PDF_TOTAL_BYTES:
             break
         aid = _norm_arxiv_id(p.arxiv_id)
-        if not aid:
+        if aid:
+            endpoint, params, fname, tag = (
+                "arxiv-pdf", {"arxiv_id": aid},
+                f"{re.sub(r'[^A-Za-z0-9._-]', '_', aid)}.pdf", aid,
+            )
+        elif p.cl_slug:
+            endpoint, params, fname, tag = (
+                "cyberleninka-pdf", {"slug": p.cl_slug},
+                f"cl_{re.sub(r'[^A-Za-z0-9._-]', '_', p.cl_slug)}.pdf", p.cl_slug,
+            )
+        elif p.doi:
+            endpoint, params, fname, tag = (
+                "oa-pdf", {"doi": p.doi},
+                f"{re.sub(r'[^A-Za-z0-9._-]', '_', p.doi)}.pdf", p.doi,
+            )
+        else:
             continue
         try:
             with httpx.Client(timeout=90) as c:
-                r = c.get(f"{root}/api/sandbox/arxiv-pdf",
-                          params={"arxiv_id": aid},
+                r = c.get(f"{root}/api/sandbox/{endpoint}", params=params,
                           headers={"Authorization": f"Bearer {api_key}"})
             if r.status_code != 200:
-                agent.log("warn", f"PDF {aid}: прокси {r.status_code}, оставляю ссылку")
+                agent.log("warn", f"PDF {tag}: прокси {r.status_code}, оставляю ссылку")
                 continue
             if total + len(r.content) > MAX_PDF_TOTAL_BYTES:
-                agent.log("warn", f"PDF {aid}: превышен общий бюджет, оставляю ссылку")
+                agent.log("warn", f"PDF {tag}: превышен общий бюджет, оставляю ссылку")
                 break
             pdf_dir.mkdir(parents=True, exist_ok=True)
-            fname = f"{re.sub(r'[^A-Za-z0-9._-]', '_', aid)}.pdf"
             (pdf_dir / fname).write_bytes(r.content)
             p.pdf_filename = f"pdfs/{fname}"
             done += 1
             total += len(r.content)
         except Exception as e:  # noqa: BLE001
-            agent.log("warn", f"PDF {aid}: не скачал ({e}), оставляю ссылку")
+            agent.log("warn", f"PDF {tag}: не скачал ({e}), оставляю ссылку")
     if done:
         agent.log("info", f"Скачано PDF-файлов: {done} ({total // 1024} КБ)")
 
 
 def _build_bibtex(papers: list[Paper]) -> str:
     out: list[str] = []
+    used: dict[str, int] = {}
     for p in papers:
+        # Гарантируем уникальность ключа (иначе LaTeX падает на дублях).
+        base = p.bibkey
+        used[base] = used.get(base, 0) + 1
+        key = base if used[base] == 1 else f"{base}_{used[base]}"
         authors = " and ".join(p.authors) if p.authors else "Unknown"
         fields = [
             f"  title = {{{p.title}}}",
@@ -376,40 +464,32 @@ def _build_bibtex(papers: list[Paper]) -> str:
             fields.append(f"  doi = {{{p.doi}}}")
         if p.url:
             fields.append(f"  url = {{{p.url}}}")
-        out.append("@article{" + p.bibkey + ",\n" + ",\n".join(fields) + "\n}\n")
+        out.append("@article{" + key + ",\n" + ",\n".join(fields) + "\n}\n")
     return "\n".join(out)
 
 
-def _build_report(topic: str, papers: list[Paper], model: str, *, unverified: bool = False) -> Document:
+def _build_report(topic: str, papers: list[Paper], model: str, queries: list[str]) -> Document:
     doc = Document()
     doc.add_heading("Поиск научных статей — отчёт", level=0)
     doc.add_paragraph(f"Тема: {topic}")
     doc.add_paragraph(f"Всего статей: {len(papers)}")
     doc.add_paragraph(f"Модель: {model}")
 
-    if unverified:
-        w = doc.add_paragraph()
-        run = w.add_run(
-            "ВНИМАНИЕ: список подобран языковой моделью из её знаний и НЕ "
-            "ПРОВЕРЕН по реальным базам. Возможны несуществующие статьи и "
-            "неверные идентификаторы. Перепроверьте каждый источник перед "
-            "использованием."
-        )
-        run.bold = True
-    else:
-        srcs = sorted({s for p in papers for s in p.provenance})
-        doc.add_paragraph(
-            "Все статьи ниже — реальные записи из баз: "
-            + (", ".join(srcs) if srcs else "—")
-            + ". Ссылки кликабельны; для arXiv-статей PDF приложен файлом."
-        )
+    srcs = sorted({s for p in papers for s in p.provenance})
+    doc.add_paragraph(
+        "Все статьи ниже — реальные записи из баз: "
+        + (", ".join(srcs) if srcs else "—")
+        + ". Ссылки кликабельны; PDF открытого доступа приложены файлами."
+    )
+
+    if queries:
+        doc.add_heading("Поисковые запросы", level=1)
+        for q in queries:
+            doc.add_paragraph(q, style="List Bullet")
 
     doc.add_heading("Ранжированный список", level=1)
     for i, p in enumerate(papers, start=1):
         doc.add_heading(f"{i}. {p.title}", level=2)
-        if p.unverified:
-            r = doc.add_paragraph().add_run("НЕ ПРОВЕРЕНО — предложено моделью")
-            r.bold = True
         if p.authors:
             doc.add_paragraph(
                 f"Авторы: {', '.join(p.authors[:6])}"
@@ -441,7 +521,7 @@ def _build_report(topic: str, papers: list[Paper], model: str, *, unverified: bo
             doc.add_paragraph(f"Ссылка: {link}")
         if p.pdf_filename:
             doc.add_paragraph(f"Файл статьи: {p.pdf_filename}")
-        elif p.arxiv_id and p.pdf_url:
+        elif p.pdf_url:
             doc.add_paragraph(f"PDF: {p.pdf_url}")
     return doc
 
@@ -450,12 +530,11 @@ def main() -> None:
     agent = Agent()
     params = agent.params
     topic: str = (params.get("topic") or "").strip()
+    description: str = (params.get("description") or "").strip()
     max_papers: int = max(5, min(30, int(params.get("max_papers", 15))))
     language: str = params.get("language", "ru")
-    raw_source: str = (params.get("source") or "real").lower()
-    # back-compat: старое значение 'arxiv' = реальный поиск
-    source = "llm" if raw_source == "llm" else "real"
     sort_by: str = (params.get("sort_by") or "relevance").lower()
+    download_pdf: bool = bool(params.get("download_pdf", True))
 
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     base_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip()
@@ -470,83 +549,71 @@ def main() -> None:
         return
 
     agent.log("info", f"science: topic={topic[:80]!r}, max={max_papers}, "
-                       f"lang={language}, model={model}, source={source}, sort={sort_by}")
+                       f"lang={language}, model={model}, sort={sort_by}")
 
-    papers: list[Paper] = []
-    unverified = False
+    agent.progress(0.1, f"{model}: генерация поисковых запросов")
+    queries = _gen_queries(topic, description, model, api_key, base_url)
+    agent.log("info", f"Запросы ({len(queries)}): {queries}")
 
-    if source == "real":
-        per_src = max_papers
-        groups: list[list[Paper]] = []
-        errors: list[str] = []
-        for name, fn in (("arXiv", _search_arxiv),
-                         ("Crossref", _search_crossref),
-                         ("Semantic Scholar", _search_s2)):
-            agent.progress(0.15, f"Поиск: {name}")
+    groups: list[list[Paper]] = []
+    errors: list[str] = []
+    n_src = len(_SOURCES)
+    for si, (name, fn, ru_only) in enumerate(_SOURCES):
+        # CyberLeninka — только по русским запросам (если есть); остальным — все.
+        src_queries = [q for q in queries if _has_cyrillic(q)] if ru_only else queries
+        if ru_only and not src_queries:
+            src_queries = queries  # русских нет — пробуем как есть
+        found = 0
+        for q in src_queries:
+            agent.progress(0.15 + 0.45 * si / n_src, f"Поиск: {name} «{q[:40]}»")
             try:
-                res = fn(topic, per_src, api_key, root)
-                agent.log("info", f"{name}: найдено {len(res)}")
+                res = fn(q, RESULTS_PER_QUERY, api_key, root)
                 groups.append(res)
+                found += len(res)
             except Exception as e:  # noqa: BLE001
                 errors.append(f"{name}: {e}")
-                agent.log("warn", f"{name} недоступен: {e}")
+                agent.log("warn", f"{name} «{q[:40]}»: {e}")
+            time.sleep(0.4)  # бережём rate-limit апстримов
+        agent.log("info", f"{name}: найдено {found}")
 
-        papers = _merge(groups)
-        if not papers:
-            # ЧЕСТНЫЙ отказ — НЕ подменяем галлюцинацией. Различаем
-            # «инфраструктура недоступна» и «реально 0 результатов»,
-            # иначе препод снова решит что агент «не умеет в русские темы».
-            if not groups and errors:
-                agent.failed(
-                    "Источники поиска недоступны (ни один не ответил), это "
-                    "сбой инфраструктуры, а не отсутствие статей по теме. "
-                    "Повторите запуск позже. Детали: " + "; ".join(errors)
-                )
-            else:
-                detail = "; ".join(errors) if errors else "все источники вернули 0 результатов"
-                agent.failed(
-                    "По теме не найдено реальных публикаций в arXiv / Crossref "
-                    "/ Semantic Scholar. Уточните формулировку (попробуйте "
-                    "ключевые слова по-английски) либо явно выберите источник "
-                    f"«Знания LLM», понимая что он не проверен. Детали: {detail}"
-                )
-            return
-        agent.progress(0.5, f"{model}: оценка релевантности и аннотации")
-        papers = _llm_rank_and_annotate(topic, papers, language, model, api_key, base_url)
-    else:
-        unverified = True
-        agent.log("warn", "ЯВНЫЙ LLM-режим: статьи НЕ проверяются по реальным базам.")
-        agent.progress(0.2, f"{model}: подбор из знаний модели (не проверено)")
-        try:
-            papers = _llm_papers(topic, max_papers, language, model, api_key, base_url)
-        except httpx.HTTPStatusError as e:
-            agent.failed(f"LLM ответил {e.response.status_code}: {e.response.text[:200]}")
-            return
-        except Exception as e:  # noqa: BLE001
-            agent.failed(f"LLM не вернула валидный JSON: {e}")
-            return
-        if not papers:
-            agent.failed("LLM не предложила ни одной публикации — переформулируй тему.")
-            return
+    papers = _merge(groups)
+    if not papers:
+        if not any(g for g in groups) and errors:
+            agent.failed(
+                "Источники поиска недоступны (ни один не ответил) — это сбой "
+                "инфраструктуры, а не отсутствие статей. Повторите запуск позже. "
+                "Детали: " + "; ".join(errors[:5])
+            )
+        else:
+            detail = "; ".join(errors[:5]) if errors else "все источники вернули 0 результатов"
+            agent.failed(
+                "По теме не найдено реальных публикаций в CyberLeninka / arXiv / "
+                "Crossref / Semantic Scholar / OpenAlex. Уточните формулировку "
+                f"(добавьте ключевые слова). Детали: {detail}"
+            )
+        return
+
+    candidates = _prelim_rank(papers)[:MAX_FOR_ANALYSIS]
+    agent.progress(0.65, f"{model}: оценка релевантности и аннотации ({len(candidates)})")
+    candidates = _llm_rank_and_annotate(topic, candidates, language, model, api_key, base_url)
 
     if sort_by == "popularity":
-        papers.sort(key=lambda p: (-p.citation_count, -p.score))
+        candidates.sort(key=lambda p: (-p.citation_count, -p.score))
     else:
-        papers.sort(key=lambda p: (-p.score, -p.citation_count))
-    papers = papers[:max_papers]
+        candidates.sort(key=lambda p: (-p.score, -p.citation_count))
+    papers = candidates[:max_papers]
 
-    if source == "real":
-        agent.progress(0.8, "Скачиваю PDF реально найденных arXiv-статей")
+    if download_pdf:
+        agent.progress(0.85, "Скачиваю PDF открытого доступа")
         _download_pdfs(agent, papers, api_key, root)
 
     for p in papers:
         agent.item_done(p.arxiv_id or p.doi or p.title[:40], summary=p.title,
-                        data={"year": p.year, "venue": p.venue, "score": p.score,
-                              "unverified": p.unverified})
+                        data={"year": p.year, "venue": p.venue, "score": p.score})
 
-    agent.progress(0.92, "Формирую report.docx и sources.bib")
+    agent.progress(0.95, "Формирую report.docx и sources.bib")
     out_dir = agent.output_dir
-    _build_report(topic, papers, model, unverified=unverified).save(out_dir / "report.docx")
+    _build_report(topic, papers, model, queries).save(out_dir / "report.docx")
     (out_dir / "sources.bib").write_text(_build_bibtex(papers), encoding="utf-8")
 
     agent.progress(1.0, "Готово")
